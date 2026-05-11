@@ -1,0 +1,13 @@
+# spyder-screen-calibrator — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# Computer vision & image processing
+opencv-python>=4.8.0
+
+# Numerical computing (usually already installed)
+numpy>=1.24.0
+
+# gPhoto2 Python bindings (wraps libgphoto2)
+# Requires libgphoto2-dev to be installed first:
+#   sudo apt install libgphoto2-dev
+gphoto2>=2.3.0
