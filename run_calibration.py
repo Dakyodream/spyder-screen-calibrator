@@ -23,6 +23,10 @@ import logging
 import sys
 from pathlib import Path
 
+# Ensure the project root is in sys.path so `spyder_calibrate` is importable
+# regardless of how/where the script is invoked.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

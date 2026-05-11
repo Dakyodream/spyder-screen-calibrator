@@ -11,6 +11,7 @@ Opens a borderless Tkinter window that:
 """
 
 from __future__ import annotations
+from .screen_utils import get_workarea
 
 import tkinter as tk
 from typing import Callable
@@ -26,8 +27,8 @@ from .references import (
 # Layout constants
 # ---------------------------------------------------------------------------
 
-_COLS = 6          # colour patch columns
-_ROWS = 4          # colour patch rows  (6×4 = 24 patches)
+_COLS = 4          # colour patch columns (portrait: 4 cols × 6 rows)
+_ROWS = 6          # colour patch rows
 _GRAY_COUNT = 8    # grayscale patches in a horizontal strip
 
 
@@ -78,6 +79,7 @@ class CalibrationDisplay:
         self._matrix = correction_matrix
         self._root: tk.Tk | None = None
         self._canvas: tk.Canvas | None = None
+        self._capture_mode: bool = False  # when True, left half is black
 
     # ------------------------------------------------------------------
     # Public API
@@ -92,13 +94,12 @@ class CalibrationDisplay:
         self._root.resizable(False, False)
 
         # Detect screen dimensions
-        sw = self._root.winfo_screenwidth()
-        sh = self._root.winfo_screenheight()
+        wa_x, wa_y, wa_w, wa_h = get_workarea()
 
-        # Occupy the RIGHT half
-        win_w = sw // 2
-        win_h = sh
-        self._root.geometry(f"{win_w}x{win_h}+{win_w}+0")
+        # Occupy the RIGHT half of the work area
+        win_w = wa_w // 2
+        win_h = wa_h
+        self._root.geometry(f"{win_w}x{win_h}+{wa_x + win_w}+{wa_y}")
         self._root.overrideredirect(True)   # borderless
 
         self._canvas = tk.Canvas(
@@ -133,14 +134,55 @@ class CalibrationDisplay:
         """
         self._matrix = matrix
         if self._root is not None and self._canvas is not None:
-            sw = self._root.winfo_screenwidth()
-            sh = self._root.winfo_screenheight()
+            _, _, wa_w, wa_h = get_workarea()
             self._canvas.delete("patch")
-            self._draw(sw // 2, sh, tag="patch")
+            self._draw(wa_w // 2, wa_h, tag="patch")
 
     # ------------------------------------------------------------------
     # Drawing helpers
     # ------------------------------------------------------------------
+
+    def set_capture_mode(self, active: bool) -> None:
+        """
+        Switch capture mode on/off.
+        When active, a black overlay covers the LEFT half of the screen
+        so the camera only sees the colour target on the right.
+        """
+        self._capture_mode = active
+        if self._root is not None and self._canvas is not None:
+            self._root.after(0, self._refresh_overlay)
+
+    def _refresh_overlay(self) -> None:
+        """
+        In capture mode: expand window to full screen, shift the colour target
+        to the RIGHT half, and fill the LEFT half with black.
+        In normal mode: shrink back to right half only.
+        """
+        if self._root is None or self._canvas is None:
+            return
+        _, _, wa_w, wa_h = get_workarea()
+        win_w = wa_w // 2
+
+        self._canvas.delete("overlay")
+
+        if self._capture_mode:
+            # Expand window to full screen starting at x=0
+            self._root.geometry(f"{wa_w}x{wa_h}+0+0")
+            self._canvas.configure(width=wa_w)
+            # Black rectangle covers the LEFT half
+            self._canvas.create_rectangle(
+                0, 0, win_w, wa_h,
+                fill="black", outline="",
+                tags="overlay",
+            )
+            # Shift all patch drawing to the RIGHT half by moving canvas items
+            # (patches were drawn at x coords 0..win_w, shift them by win_w)
+            self._canvas.move("patch", win_w, 0)
+        else:
+            # Move patches back to left of canvas before shrinking
+            self._canvas.move("patch", -win_w, 0)
+            self._root.geometry(f"{win_w}x{wa_h}+{win_w}+0")
+            self._canvas.configure(width=win_w)
 
     def _draw(self, w: int, h: int, tag: str = "patch") -> None:
         """Render all patches onto the canvas."""

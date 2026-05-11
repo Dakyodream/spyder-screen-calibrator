@@ -97,8 +97,8 @@ def detect_both_halves(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-_GRID_COLS = 6
-_GRID_ROWS = 4
+_GRID_COLS = 4   # portrait orientation
+_GRID_ROWS = 6
 _N_COLOR   = _GRID_COLS * _GRID_ROWS   # 24
 _N_GRAY    = 8
 
@@ -149,43 +149,73 @@ def _detect_half(
 
 def _find_patch_rectangles(gray_or_bgr: np.ndarray) -> list[tuple[int, int, int, int]]:
     """
-    Use contour detection to find candidate patch rectangles.
-
-    Returns list of (x, y, w, h) in image coordinates.
+    Detect coloured patch rectangles using two complementary strategies:
+    1. Morphological approach: threshold bright/saturated regions, find contours
+    2. Edge-based: Canny on grayscale
+    Both results are merged and deduplicated.
     """
     if len(gray_or_bgr.shape) == 3:
-        gray = cv2.cvtColor(gray_or_bgr, cv2.COLOR_BGR2GRAY)
+        bgr = gray_or_bgr
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     else:
-        gray = gray_or_bgr.copy()
-
-    blurred = cv2.GaussianBlur(gray, (7, 7), 0)
-    edges = cv2.Canny(blurred, 30, 100)
-    edges = cv2.dilate(edges, None, iterations=2)
-
-    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        gray = gray_or_bgr
+        bgr = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
 
     h_img, w_img = gray.shape[:2]
     area_img = h_img * w_img
 
     rects: list[tuple[int, int, int, int]] = []
-    for cnt in contours:
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if len(approx) != 4:
-            continue
-        x, y, w, h = cv2.boundingRect(approx)
-        area = w * h
-        aspect = w / max(h, 1)
-        # Expect roughly square patches, between 0.5% and 15% of image area
-        if not (0.005 * area_img < area < 0.15 * area_img):
-            continue
-        if not (0.5 < aspect < 2.5):
-            continue
-        rects.append((x, y, w, h))
 
-    # Remove duplicates / overlapping boxes (keep largest)
+    # --- Strategy 1: morphological on grayscale ---
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    # Try multiple threshold levels to catch both dark and light patches
+    for thresh_val in [30, 60, 100, 150]:
+        _, binary = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+        closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rects.extend(_contours_to_rects(contours, area_img))
+
+    # --- Strategy 2: Canny edges ---
+    edges = cv2.Canny(blurred, 20, 80)
+    edges = cv2.dilate(edges, None, iterations=3)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects.extend(_contours_to_rects(contours, area_img))
+
+    # --- Strategy 3: adaptive threshold ---
+    adaptive = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY, 51, 5
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    adaptive = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel, iterations=3)
+    contours, _ = cv2.findContours(adaptive, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rects.extend(_contours_to_rects(contours, area_img))
+
     rects = _deduplicate_rects(rects)
     return rects
+
+
+def _contours_to_rects(
+    contours,
+    area_img: int,
+    min_frac: float = 0.003,
+    max_frac: float = 0.18,
+    min_aspect: float = 0.4,
+    max_aspect: float = 3.0,
+) -> list[tuple[int, int, int, int]]:
+    """Filter contours by area and aspect ratio and return bounding rects."""
+    result = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        aspect = w / max(h, 1)
+        if not (min_frac * area_img < area < max_frac * area_img):
+            continue
+        if not (min_aspect < aspect < max_aspect):
+            continue
+        result.append((x, y, w, h))
+    return result
 
 
 def _deduplicate_rects(
@@ -226,7 +256,7 @@ def _classify_rects(
     reading order.
     """
     h_img = shape[0]
-    threshold_y = int(h_img * 0.78)
+    threshold_y = int(h_img * 0.97)   # portrait 6-row grid: row 6 centre ~91.7%
 
     color_rects = [r for r in rects if r[1] + r[3] // 2 < threshold_y]
     gray_rects  = [r for r in rects if r[1] + r[3] // 2 >= threshold_y]

@@ -9,6 +9,7 @@ calibration target display (right side).  The control window shows:
 """
 
 from __future__ import annotations
+from .screen_utils import get_workarea
 
 import logging
 import sys
@@ -66,15 +67,15 @@ class CalibrationApp:
     def __init__(self) -> None:
         self._session: CalibrationSession | None = None
         self._icc_path: Path | None = None
+        self._showing_corrected: bool = True  # toggle state for before/after preview
 
         # --- Root window ---
         self.root = tk.Tk()
         self.root.title("SpyderCheckr Screen Calibrator")
         self.root.configure(bg="#1e1e1e")
 
-        sw = self.root.winfo_screenwidth()
-        sh = self.root.winfo_screenheight()
-        self.root.geometry(f"{sw // 2}x{sh}+0+0")
+        wa_x, wa_y, wa_w, wa_h = get_workarea()
+        self.root.geometry(f"{wa_w // 2}x{wa_h}+{wa_x}+{wa_y}")
         self.root.resizable(False, False)
 
         self._build_ui()
@@ -162,6 +163,15 @@ class CalibrationApp:
         )
         self._btn_apply.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
 
+        self._btn_toggle = tk.Button(
+            btn_frame, text="👁  Before",
+            font=("Helvetica", 12),
+            bg="#555555", fg="white", activebackground="#777777",
+            relief=tk.FLAT, cursor="hand2", state=tk.DISABLED,
+            command=self._toggle_preview,
+        )
+        self._btn_toggle.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+
         ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=16, pady=8)
 
         # Log area
@@ -207,6 +217,7 @@ class CalibrationApp:
 
         def run_display() -> None:
             self._session.display_update_fn = self._display.update_matrix
+            self._session.display_ref = self._display
             self._display.show()   # blocks until closed
 
         display_thread = threading.Thread(target=run_display, daemon=True, name="DisplayThread")
@@ -228,6 +239,21 @@ class CalibrationApp:
             self._session.stop()
         self._btn_start.configure(state=tk.NORMAL)
         self._btn_stop.configure(state=tk.DISABLED)
+
+    def _toggle_preview(self) -> None:
+        """Switch the on-screen target between corrected (After) and uncorrected (Before)."""
+        self._showing_corrected = not self._showing_corrected
+        if self._showing_corrected:
+            # Show corrected colours
+            matrix = self._session.current_matrix if self._session else None
+            label = "👁  Before"
+        else:
+            # Show original uncorrected colours
+            matrix = None
+            label = "✅  After"
+        self._btn_toggle.configure(text=label)
+        if hasattr(self, "_display") and self._display is not None:
+            self._display.update_matrix(matrix)
 
     def _apply_profile(self) -> None:
         if self._icc_path is None or not self._icc_path.exists():
@@ -287,6 +313,7 @@ class CalibrationApp:
         self.root.after(0, self._btn_start.configure, {"state": tk.NORMAL})
         self.root.after(0, self._btn_stop.configure, {"state": tk.DISABLED})
         self.root.after(0, self._btn_apply.configure, {"state": tk.NORMAL})
+        self.root.after(0, self._btn_toggle.configure, {"state": tk.NORMAL})
         self.root.after(0, self._progress.configure, {"value": 100})
         self.root.after(
             0,

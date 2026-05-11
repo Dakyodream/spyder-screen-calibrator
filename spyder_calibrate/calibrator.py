@@ -83,6 +83,7 @@ class CalibrationSession:
 
         # Injected by main.py after the display window is created
         self.display_update_fn: Callable[[np.ndarray | None], None] | None = None
+        self.display_ref = None  # reference to CalibrationDisplay instance
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -128,9 +129,17 @@ class CalibrationSession:
 
                 logger.info("--- Pass %d / %d ---", pass_num, self.n_passes)
 
-                # 1. Capture
+                # 1. Black overlay → capture → restore
+                if self.display_ref is not None:
+                    self.display_ref.set_capture_mode(True)
+                    time.sleep(0.8)  # let the overlay render before shooting
+
                 logger.info("Triggering capture…")
-                raw_path = self._camera.capture(output_dir=pass_dir)
+                try:
+                    raw_path = self._camera.capture(output_dir=pass_dir)
+                finally:
+                    if self.display_ref is not None:
+                        self.display_ref.set_capture_mode(False)
 
                 # 2. Convert RAW → BGR
                 logger.info("Converting RAW to BGR…")
@@ -144,7 +153,11 @@ class CalibrationSession:
                 if screen.debug_img is not None:
                     debug_path = pass_dir / f"debug_pass{pass_num}.jpg"
                     import cv2
-                    cv2.imwrite(str(debug_path), (screen.debug_img * 255).astype("uint8"))
+                    dbg = screen.debug_img
+                    if dbg.dtype != np.uint8:
+                        dbg_max = dbg.max()
+                        dbg = (dbg / dbg_max * 255).astype(np.uint8) if dbg_max > 0 else dbg.astype(np.uint8)
+                    cv2.imwrite(str(debug_path), dbg)
                     logger.info("Debug image saved: %s", debug_path)
 
                 # 4. Compute correction from screen measurements vs reference
