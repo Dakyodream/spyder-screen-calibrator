@@ -326,6 +326,46 @@ def _fallback_grid(
     return color_rects, gray_rects
 
 
+# ---------------------------------------------------------------------------
+# Screen-only calibration: sample a single fullscreen solid-colour capture
+# ---------------------------------------------------------------------------
+
+def sample_fullscreen_center(
+    image_bgr: np.ndarray,
+    sample_fraction: float = 0.4,
+) -> tuple[float, float, float]:
+    """
+    Sample the central region of a fullscreen solid-colour capture.
+
+    Parameters
+    ----------
+    image_bgr:
+        Full-frame BGR image (float32 [0,1] or uint8).
+    sample_fraction:
+        Fraction of each dimension to sample from the centre.
+        Default 0.4 = central 40% (avoids panel corners and vignetting).
+
+    Returns
+    -------
+    (B, G, R) mean values in the [0, 255] range.
+    """
+    if image_bgr.dtype != np.uint8:
+        img8 = (np.clip(image_bgr, 0, 1) * 255).astype(np.uint8)
+    else:
+        img8 = image_bgr
+
+    h, w = img8.shape[:2]
+    margin_x = int(w * (1 - sample_fraction) / 2)
+    margin_y = int(h * (1 - sample_fraction) / 2)
+    roi = img8[margin_y : h - margin_y, margin_x : w - margin_x]
+
+    if roi.size == 0:
+        return (0.0, 0.0, 0.0)
+
+    mean = cv2.mean(roi)[:3]
+    return (float(mean[0]), float(mean[1]), float(mean[2]))
+
+
 def _mean_colour(
     image: np.ndarray,
     rect: tuple[int, int, int, int],

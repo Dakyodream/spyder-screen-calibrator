@@ -1,17 +1,20 @@
 """
-calibrator.py — Real-time calibration orchestrator.
+calibrator.py — Screen WB calibration orchestrator.
 
-Coordinates the full multi-pass calibration loop:
-  1. Show the on-screen target (CalibrationDisplay).
-  2. Trigger a camera capture (Camera).
-  3. Detect patch colours from both halves of the photo (detect_both_halves).
-  4. Compute correction matrix (compute_correction_matrix).
-  5. Update the on-screen display with the corrected colours.
-  6. Repeat for N passes (default 3).
-  7. Export an ICC profile.
+Approach
+--------
+A camera is a reliable colorimeter for NEUTRAL GRAYS but not for saturated
+colours (camera-screen metamerism, backlight bleed on dark patches).
 
-Designed to run in a background thread so the Tkinter main loop stays
-responsive.
+For each pass the session:
+  1. Displays each of the 4 brightest neutral patches fullscreen.
+  2. Captures a RAW frame and samples the centre region.
+  3. Computes a per-channel diagonal WB correction from those 4 measurements,
+     normalised to the white point to decouple exposure from colour error.
+
+Result: an ICC display profile that corrects the screen's white-point drift
+(colour temperature error) without trying to correct gamut or tone — which
+requires a hardware colorimeter.
 """
 
 from __future__ import annotations
@@ -25,54 +28,51 @@ from typing import Callable
 import numpy as np
 
 from .camera import Camera
-from .correction import CorrectionResult, build_icc_profile, compute_correction_matrix
-from .detection import detect_both_halves
-from .references import ALL_PATCHES, COLOR_PATCHES, GRAY_PATCHES
+from .correction import CorrectionResult, apply_matrix_to_srgb, build_icc_profile, compute_wb_correction
+from .detection import sample_fullscreen_center
+from .references import NEUTRAL_PATCHES_SRGB
 
 logger = logging.getLogger(__name__)
 
 
-# Full Lab reference array (32 rows: 24 color + 8 gray)
-_REFERENCE_LAB = np.array(
-    [(L, a, b) for (_, L, a, b) in ALL_PATCHES],
-    dtype=np.float64,
-)
-
-
-# ---------------------------------------------------------------------------
-# CalibrationSession
-# ---------------------------------------------------------------------------
-
 class CalibrationSession:
     """
-    Manages a complete multi-pass calibration session.
+    Multi-pass screen WB calibration session.
+
+    Only the 4 brightest neutral patches are captured (White, Neutral 8,
+    Neutral 6.5, Neutral 5).  This keeps the total capture count low
+    (4 × n_passes) and avoids the backlight-bleed artefacts that corrupt
+    dark-patch measurements.
 
     Parameters
     ----------
     output_dir:
-        Directory where RAW captures and the final ICC profile are saved.
+        Directory where captures and the ICC profile are saved.
     n_passes:
-        Number of capture + correction iterations (default: 3).
-    on_progress:
-        Optional callback ``(pass_number, total_passes, delta_e)`` called
-        after each pass with the current ΔE improvement.
+        Number of capture+correction iterations (default: 3).
+    on_patch_progress:
+        Callback ``(pass_num, patch_idx, n_patches, overall_pct, patch_name)``.
+    on_pass_complete:
+        Callback ``(pass_num, total_passes, de_before, de_after)``.
     on_complete:
-        Optional callback ``(icc_path)`` called when the profile is ready.
+        Callback ``(icc_path)`` when the profile is ready.
     on_error:
-        Optional callback ``(exception)`` called on any fatal error.
+        Callback ``(exception)`` on any fatal error.
     """
 
     def __init__(
         self,
         output_dir: Path | None = None,
         n_passes: int = 3,
-        on_progress: Callable[[int, int, float, float], None] | None = None,
+        on_patch_progress: Callable[[int, int, int, int, str], None] | None = None,
+        on_pass_complete: Callable[[int, int, float, float], None] | None = None,
         on_complete: Callable[[Path], None] | None = None,
         on_error: Callable[[Exception], None] | None = None,
     ) -> None:
         self.output_dir = Path(output_dir or "output")
         self.n_passes = n_passes
-        self.on_progress = on_progress
+        self.on_patch_progress = on_patch_progress
+        self.on_pass_complete = on_pass_complete
         self.on_complete = on_complete
         self.on_error = on_error
 
@@ -81,46 +81,42 @@ class CalibrationSession:
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
 
-        # Injected by main.py after the display window is created
-        self.display_update_fn: Callable[[np.ndarray | None], None] | None = None
-        self.display_ref = None  # reference to CalibrationDisplay instance
+        self.display_ref = None  # CalibrationDisplay instance, injected by main.py
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    @property
+    def current_matrix(self) -> np.ndarray | None:
+        return self._matrix
 
     def start(self) -> None:
-        """Start the calibration loop in a background thread."""
         self._thread = threading.Thread(target=self._run, daemon=True, name="CalibrationLoop")
         self._thread.start()
 
     def stop(self) -> None:
-        """Signal the calibration loop to stop gracefully."""
         self._stop_event.set()
 
     def wait(self, timeout: float | None = None) -> None:
-        """Wait for the calibration thread to finish."""
         if self._thread is not None:
             self._thread.join(timeout=timeout)
 
     # ------------------------------------------------------------------
-    # Main calibration loop
+    # Main loop
     # ------------------------------------------------------------------
 
     def _run(self) -> None:
         try:
-            logger.info("=== SpyderCheckr Calibration Session Start ===")
+            logger.info("=== WB Calibration Session Start ===")
+            logger.info("Using %d neutral patches × %d passes", len(NEUTRAL_PATCHES_SRGB), self.n_passes)
             self.output_dir.mkdir(parents=True, exist_ok=True)
             pass_dir = self.output_dir / "captures"
             pass_dir.mkdir(exist_ok=True)
 
-            # Connect camera
             logger.info("Connecting to camera…")
             self._camera.connect()
             self._camera.configure_for_calibration()
+            time.sleep(1.0)
 
-            # Wait a moment for the display to stabilise
-            time.sleep(1.5)
+            n_patches = len(NEUTRAL_PATCHES_SRGB)
+            total_captures = self.n_passes * n_patches
 
             for pass_num in range(1, self.n_passes + 1):
                 if self._stop_event.is_set():
@@ -128,71 +124,74 @@ class CalibrationSession:
                     break
 
                 logger.info("--- Pass %d / %d ---", pass_num, self.n_passes)
+                measured_bgr: list[tuple[float, float, float]] = []
 
-                # 1. Black overlay → capture → restore
-                if self.display_ref is not None:
-                    self.display_ref.set_capture_mode(True)
-                    time.sleep(0.8)  # let the overlay render before shooting
+                for patch_idx, (name, r_ref, g_ref, b_ref) in enumerate(NEUTRAL_PATCHES_SRGB):
+                    if self._stop_event.is_set():
+                        break
 
-                logger.info("Triggering capture…")
-                try:
-                    raw_path = self._camera.capture(output_dir=pass_dir)
-                finally:
+                    # Apply accumulated correction to the displayed colour
+                    if self._matrix is not None:
+                        r_disp, g_disp, b_disp = apply_matrix_to_srgb(
+                            (r_ref, g_ref, b_ref), self._matrix
+                        )
+                    else:
+                        r_disp, g_disp, b_disp = r_ref, g_ref, b_ref
+
+                    logger.debug("Pass %d  patch %d/%d — %s  display(%d,%d,%d)",
+                                 pass_num, patch_idx + 1, n_patches, name,
+                                 r_disp, g_disp, b_disp)
+
+                    # Show colour fullscreen
                     if self.display_ref is not None:
-                        self.display_ref.set_capture_mode(False)
+                        self.display_ref.set_solid_color(r_disp, g_disp, b_disp)
+                    time.sleep(0.5)  # let screen and AWB settle
 
-                # 2. Convert RAW → BGR
-                logger.info("Converting RAW to BGR…")
-                img_bgr = Camera.raw_to_bgr(raw_path)
+                    # Capture and sample centre
+                    raw_path = self._camera.capture(output_dir=pass_dir)
+                    img_bgr = Camera.raw_to_bgr(raw_path)
+                    measured = sample_fullscreen_center(img_bgr)
+                    measured_bgr.append(measured)
 
-                # 3. Detect patches
-                logger.info("Detecting patches…")
-                physical, screen = detect_both_halves(img_bgr, debug=True)
+                    logger.debug("  measured BGR: (%.1f, %.1f, %.1f)", *measured)
 
-                # Save debug image
-                if screen.debug_img is not None:
-                    debug_path = pass_dir / f"debug_pass{pass_num}.jpg"
-                    import cv2
-                    dbg = screen.debug_img
-                    if dbg.dtype != np.uint8:
-                        dbg_max = dbg.max()
-                        dbg = (dbg / dbg_max * 255).astype(np.uint8) if dbg_max > 0 else dbg.astype(np.uint8)
-                    cv2.imwrite(str(debug_path), dbg)
-                    logger.info("Debug image saved: %s", debug_path)
+                    done = (pass_num - 1) * n_patches + patch_idx + 1
+                    pct = int(done / total_captures * 100)
+                    if self.on_patch_progress:
+                        self.on_patch_progress(pass_num, patch_idx + 1, n_patches, pct, name)
 
-                # 4. Compute correction from screen measurements vs reference
-                logger.info("Computing correction matrix…")
-                result: CorrectionResult = compute_correction_matrix(
-                    measured_bgr=screen.all_bgr,
-                    reference_lab=_REFERENCE_LAB,
+                if self._stop_event.is_set() or len(measured_bgr) < n_patches:
+                    break
+
+                # Compute diagonal WB correction
+                result: CorrectionResult = compute_wb_correction(
+                    measured_bgr=measured_bgr,
+                    reference_srgb=[(r, g, b) for (_, r, g, b) in NEUTRAL_PATCHES_SRGB],
                 )
 
-                # Accumulate matrix (compose with previous if any)
+                # Compose with previous pass
                 if self._matrix is None:
                     self._matrix = result.matrix
                 else:
-                    # Chain: new correction applied after previous
                     self._matrix = result.matrix @ self._matrix
 
                 logger.info(
-                    "Pass %d complete — ΔE before: %.2f, after: %.2f",
+                    "Pass %d — ΔE before: %.2f  after: %.2f",
                     pass_num, result.delta_e_before, result.delta_e_after,
                 )
 
-                # 5. Update display
-                if self.display_update_fn is not None:
-                    self.display_update_fn(self._matrix)
+                if self.on_pass_complete:
+                    self.on_pass_complete(pass_num, self.n_passes,
+                                          result.delta_e_before, result.delta_e_after)
 
-                # 6. Report progress
-                if self.on_progress:
-                    self.on_progress(pass_num, self.n_passes,
-                                     result.delta_e_before, result.delta_e_after)
-
-                # Short pause before next pass
                 if pass_num < self.n_passes:
-                    time.sleep(2.0)
+                    time.sleep(1.0)
 
-            # 7. Build ICC profile
+            # Switch display to comparison grid
+            if self.display_ref is not None:
+                self.display_ref.show_comparison(self._matrix)
+
+            # Build ICC profile
             if self._matrix is not None:
                 icc_path = self.output_dir / "calibration.icc"
                 build_icc_profile(self._matrix, icc_path)
@@ -200,19 +199,11 @@ class CalibrationSession:
                 if self.on_complete:
                     self.on_complete(icc_path)
             else:
-                logger.warning("No correction matrix computed — ICC profile not generated.")
+                logger.warning("No correction matrix computed.")
 
         except Exception as exc:
-            logger.exception("Calibration session error: %s", exc)
+            logger.exception("Calibration error: %s", exc)
             if self.on_error:
                 self.on_error(exc)
         finally:
             self._camera.disconnect()
-
-    # ------------------------------------------------------------------
-    # Properties
-    # ------------------------------------------------------------------
-
-    @property
-    def current_matrix(self) -> np.ndarray | None:
-        return self._matrix

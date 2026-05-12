@@ -192,6 +192,96 @@ def _delta_e_simple(lab_a: np.ndarray, lab_b: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# WB-only diagonal correction (reliable with a camera)
+# ---------------------------------------------------------------------------
+
+def compute_wb_correction(
+    measured_bgr: list[tuple[float, float, float]],
+    reference_srgb: list[tuple[int, int, int]],
+) -> CorrectionResult:
+    """
+    Compute a per-channel diagonal correction matrix from neutral-patch measurements.
+
+    Why diagonal / why neutral patches only
+    ----------------------------------------
+    A camera photographs a screen through a scene-calibrated pipeline that
+    introduces cross-channel contamination for saturated colours (metamerism).
+    Neutral grays are immune to this effect — their measured R:G:B ratio is a
+    reliable indicator of the screen's white-point error.
+
+    Algorithm
+    ---------
+    1. Convert measured and reference values to linear light.
+    2. Normalise both to the white (first) patch — decouples absolute exposure
+       from the colour error we actually care about.
+    3. Fit a per-channel scalar gain via least-squares through the origin.
+       Gain < 1  → that channel is over-represented on screen (reduce it).
+    4. Normalise gains so max(gains) = 1 — ensures display values stay ≤ 255
+       (an ICC display profile can only reduce channels, not boost them).
+    5. Return a 3×3 diagonal matrix M such that the OS will send
+       M @ colour_linear  to the GPU instead of  colour_linear.
+
+    Parameters
+    ----------
+    measured_bgr:
+        Camera-sampled (B, G, R) float values in [0, 255] for each neutral patch,
+        in the same order as ``reference_srgb``.
+    reference_srgb:
+        (R, G, B) uint8 values that were displayed for each patch.
+    """
+    assert len(measured_bgr) == len(reference_srgb), "Patch count mismatch"
+
+    # Convert to linear RGB [0, 1]  (BGR → RGB for measured)
+    meas_lin = np.array([
+        _srgb_to_linear(np.array([r, g, b], dtype=np.float64) / 255.0)
+        for b, g, r in measured_bgr
+    ])
+    ref_lin = np.array([
+        _srgb_to_linear(np.array([r, g, b], dtype=np.float64) / 255.0)
+        for r, g, b in reference_srgb
+    ])
+
+    # ΔE before correction
+    meas_lab = np.array([_xyz_to_lab(_SRGB_TO_XYZ_D50 @ lin, _D50_XYZ) for lin in meas_lin])
+    ref_lab  = np.array([_xyz_to_lab(_SRGB_TO_XYZ_D50 @ lin, _D50_XYZ) for lin in ref_lin])
+    de_before = float(np.mean(_delta_e_simple(meas_lab, ref_lab)))
+
+    # Normalise to white point (first patch) — isolates colour error from exposure
+    white_meas = meas_lin[0] + 1e-9
+    white_ref  = ref_lin[0]  + 1e-9
+    meas_norm  = meas_lin / white_meas   # white → (1, 1, 1)
+    ref_norm   = ref_lin  / white_ref    # white → (1, 1, 1)
+
+    # Per-channel least-squares scalar through origin:
+    # gain_c = Σ(meas_c · ref_c) / Σ(meas_c²)
+    gains = np.array([
+        np.dot(meas_norm[:, c], ref_norm[:, c]) / (np.dot(meas_norm[:, c], meas_norm[:, c]) + 1e-9)
+        for c in range(3)
+    ])
+
+    # Normalise so max gain = 1 → no channel can clip when ICC is applied
+    gains = gains / (gains.max() + 1e-9)
+
+    matrix = np.diag(gains)
+    logger.info("WB gains  R=%.3f  G=%.3f  B=%.3f", *gains)
+
+    # ΔE after: apply gains in normalised linear space, rescale to ref white
+    corrected_norm = (matrix @ meas_norm.T).T
+    corrected_abs  = np.clip(corrected_norm * white_ref, 0.0, 1.0)
+    corr_lab  = np.array([_xyz_to_lab(_SRGB_TO_XYZ_D50 @ lin, _D50_XYZ) for lin in corrected_abs])
+    patch_de  = _delta_e_simple(corr_lab, ref_lab)
+    de_after  = float(np.mean(patch_de))
+
+    logger.info("WB ΔE before: %.2f  |  ΔE after: %.2f", de_before, de_after)
+    return CorrectionResult(
+        matrix=matrix,
+        delta_e_before=de_before,
+        delta_e_after=de_after,
+        patch_errors=patch_de,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Utility: apply matrix to a display patch colour
 # ---------------------------------------------------------------------------
 

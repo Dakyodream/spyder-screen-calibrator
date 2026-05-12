@@ -100,10 +100,10 @@ class Camera:
         self._assert_connected()
         settings = {
             "/main/capturesettings/autoexposuremode": "Manual",
-            "/main/imgsettings/iso":                  "800",
-            "/main/capturesettings/shutterspeed":     "1/10",
+            "/main/imgsettings/iso":                  "1600",
+            "/main/capturesettings/shutterspeed":     "1/8",
             "/main/capturesettings/aperture":         "5.6",
-            "/main/imgsettings/whitebalance":         "Daylight",
+            "/main/imgsettings/whitebalance":         "Auto",
             "/main/capturesettings/picturestyle":     "Neutral",
             "/main/settings/capturetarget":           "Internal RAM",
             "/main/imgsettings/imageformat":          "RAW",

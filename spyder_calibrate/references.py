@@ -67,7 +67,7 @@ GRAY_PATCHES: list[tuple[str, float, float, float]] = [
 ]
 
 # Combined ordered list used for matrix computation
-ALL_PATCHES = COLOR_PATCHES # + GRAY_PATCHES
+ALL_PATCHES = COLOR_PATCHES  # + GRAY_PATCHES
 
 # sRGB display values for each patch — portrait order (4 cols × 6 rows).
 # Values measured from the physical SpyderCheckr 24 card.
@@ -113,4 +113,12 @@ GRAY_PATCHES_SRGB: list[tuple[str, int, int, int]] = [
     ("Gray 6", 160, 160, 160),
     ("Gray 7", 200, 200, 200),
     ("Gray 8", 243, 243, 243),
+]
+
+# Neutral patches used for WB calibration: 4 brightest neutral grays only.
+# Dark patches (Neutral 3.5, Black) are excluded — backlight bleed
+# contaminates their measurements and would skew the correction.
+_NEUTRAL_INDICES = [0, 4, 8, 12]  # White, Neutral 8, Neutral 6.5, Neutral 5
+NEUTRAL_PATCHES_SRGB: list[tuple[str, int, int, int]] = [
+    COLOR_PATCHES_SRGB[i] for i in _NEUTRAL_INDICES
 ]

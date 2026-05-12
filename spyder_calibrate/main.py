@@ -1,28 +1,21 @@
 """
-main.py — SpyderCheckr Screen Calibrator — main entry point.
+main.py — SpyderCheckr Screen Calibrator — control panel.
 
-Launches a small control window (left side of screen) alongside the
-calibration target display (right side).  The control window shows:
-  - Status / progress log
-  - ΔE improvement per pass
-  - Start / Stop / Apply Profile buttons
+Small floating window (top-left corner, always on top) so the camera's
+centre-sample region is unaffected during calibration.
+
+The fullscreen calibration display runs in a separate thread/window.
 """
 
 from __future__ import annotations
-from .screen_utils import get_workarea
 
 import logging
-import sys
 import threading
 import tkinter as tk
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
 from .calibrator import CalibrationSession
-
-# ---------------------------------------------------------------------------
-# Logging setup
-# ---------------------------------------------------------------------------
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,10 +24,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# GUI helpers
-# ---------------------------------------------------------------------------
 
 class TextHandler(logging.Handler):
     """Route log records to a Tkinter ScrolledText widget."""
@@ -54,29 +43,28 @@ class TextHandler(logging.Handler):
         self.widget.configure(state="disabled")
 
 
-# ---------------------------------------------------------------------------
-# Main application window
-# ---------------------------------------------------------------------------
-
 class CalibrationApp:
     """
-    Control panel window.  Shown on the LEFT half of the screen.
-    The CalibrationDisplay (target) runs on the RIGHT half.
+    Compact floating control panel.
+
+    Positioned at the top-left corner (400×480 px) and kept always on top
+    so it remains accessible while the display window covers the screen.
+    The camera samples the central 40% of the image, so this panel is safely
+    outside that region on any ≥1080p screen.
     """
 
     def __init__(self) -> None:
         self._session: CalibrationSession | None = None
         self._icc_path: Path | None = None
-        self._showing_corrected: bool = True  # toggle state for before/after preview
+        self._showing_corrected: bool = True
+        self._display = None
 
-        # --- Root window ---
         self.root = tk.Tk()
-        self.root.title("SpyderCheckr Screen Calibrator")
+        self.root.title("SpyderCheckr Calibrator")
         self.root.configure(bg="#1e1e1e")
-
-        wa_x, wa_y, wa_w, wa_h = get_workarea()
-        self.root.geometry(f"{wa_w // 2}x{wa_h}+{wa_x}+{wa_y}")
+        self.root.attributes("-topmost", True)
         self.root.resizable(False, False)
+        self.root.geometry("400x480+0+0")
 
         self._build_ui()
         self._attach_log_handler()
@@ -87,106 +75,99 @@ class CalibrationApp:
 
     def _build_ui(self) -> None:
         root = self.root
-        pad = {"padx": 16, "pady": 8}
+        pad = {"padx": 12, "pady": 6}
 
-        # Title
         tk.Label(
             root, text="SpyderCheckr Screen Calibrator",
-            font=("Helvetica", 18, "bold"),
+            font=("Helvetica", 13, "bold"),
             bg="#1e1e1e", fg="#e0e0e0",
         ).pack(fill=tk.X, **pad)
 
-        tk.Label(
-            root,
-            text="Place the physical SpyderCheckr 24 on the LEFT half of the frame.\n"
-                 "The on-screen target is shown on the RIGHT half.",
-            font=("Helvetica", 10),
-            bg="#1e1e1e", fg="#888888",
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, padx=16, pady=(0, 8))
+        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=12)
 
-        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=16)
-
-        # Passes control
+        # Passes
         passes_frame = tk.Frame(root, bg="#1e1e1e")
         passes_frame.pack(fill=tk.X, **pad)
-        tk.Label(
-            passes_frame, text="Number of passes:", bg="#1e1e1e", fg="#c0c0c0",
-            font=("Helvetica", 11),
-        ).pack(side=tk.LEFT)
+        tk.Label(passes_frame, text="Passes:", bg="#1e1e1e", fg="#c0c0c0",
+                 font=("Helvetica", 10)).pack(side=tk.LEFT)
         self._passes_var = tk.IntVar(value=3)
-        ttk.Spinbox(
-            passes_frame, from_=1, to=10,
-            textvariable=self._passes_var, width=4,
-            font=("Helvetica", 11),
-        ).pack(side=tk.LEFT, padx=8)
+        ttk.Spinbox(passes_frame, from_=1, to=10,
+                    textvariable=self._passes_var, width=4,
+                    font=("Helvetica", 10)).pack(side=tk.LEFT, padx=6)
 
         # Progress bar
         self._progress = ttk.Progressbar(root, mode="determinate", maximum=100)
-        self._progress.pack(fill=tk.X, padx=16, pady=4)
+        self._progress.pack(fill=tk.X, padx=12, pady=3)
 
-        # ΔE display
+        # Status
+        self._status_var = tk.StringVar(value="Ready — press Start to begin")
+        tk.Label(
+            root, textvariable=self._status_var,
+            font=("Helvetica", 10), bg="#1e1e1e", fg="#88ccff",
+            wraplength=376, justify=tk.LEFT,
+        ).pack(padx=12, pady=2, anchor=tk.W)
+
+        # ΔE
         self._de_var = tk.StringVar(value="ΔE — not measured yet")
         tk.Label(
             root, textvariable=self._de_var,
-            font=("Helvetica", 12), bg="#1e1e1e", fg="#88ccff",
-        ).pack(**pad)
+            font=("Helvetica", 10), bg="#1e1e1e", fg="#aaffaa",
+        ).pack(padx=12, pady=2)
 
-        # Buttons
+        # Buttons — row 1
         btn_frame = tk.Frame(root, bg="#1e1e1e")
-        btn_frame.pack(fill=tk.X, **pad)
+        btn_frame.pack(fill=tk.X, padx=12, pady=4)
 
         self._btn_start = tk.Button(
-            btn_frame, text="▶  Start Calibration",
-            font=("Helvetica", 12, "bold"),
+            btn_frame, text="▶  Start",
+            font=("Helvetica", 11, "bold"),
             bg="#2d7d46", fg="white", activebackground="#3aad60",
             relief=tk.FLAT, cursor="hand2",
             command=self._start,
         )
-        self._btn_start.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+        self._btn_start.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         self._btn_stop = tk.Button(
             btn_frame, text="■  Stop",
-            font=("Helvetica", 12),
+            font=("Helvetica", 11),
             bg="#7d2d2d", fg="white", activebackground="#ad3a3a",
             relief=tk.FLAT, cursor="hand2", state=tk.DISABLED,
             command=self._stop,
         )
-        self._btn_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+        self._btn_stop.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+
+        # Buttons — row 2
+        btn_frame2 = tk.Frame(root, bg="#1e1e1e")
+        btn_frame2.pack(fill=tk.X, padx=12, pady=2)
 
         self._btn_apply = tk.Button(
-            btn_frame, text="🎨  Apply Profile",
-            font=("Helvetica", 12),
+            btn_frame2, text="Apply Profile",
+            font=("Helvetica", 11),
             bg="#2d5f7d", fg="white", activebackground="#3a7dad",
             relief=tk.FLAT, cursor="hand2", state=tk.DISABLED,
             command=self._apply_profile,
         )
-        self._btn_apply.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+        self._btn_apply.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
         self._btn_toggle = tk.Button(
-            btn_frame, text="👁  Before",
-            font=("Helvetica", 12),
+            btn_frame2, text="👁  Before",
+            font=("Helvetica", 11),
             bg="#555555", fg="white", activebackground="#777777",
             relief=tk.FLAT, cursor="hand2", state=tk.DISABLED,
             command=self._toggle_preview,
         )
-        self._btn_toggle.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=4)
+        self._btn_toggle.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
-        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=16, pady=8)
+        ttk.Separator(root, orient="horizontal").pack(fill=tk.X, padx=12, pady=4)
 
-        # Log area
-        tk.Label(
-            root, text="Log", bg="#1e1e1e", fg="#888888",
-            font=("Helvetica", 10, "bold"),
-        ).pack(anchor=tk.W, padx=16)
-
+        # Log
+        tk.Label(root, text="Log", bg="#1e1e1e", fg="#888888",
+                 font=("Helvetica", 9, "bold")).pack(anchor=tk.W, padx=12)
         self._log_widget = scrolledtext.ScrolledText(
-            root, state="disabled",
-            font=("Courier", 9),
-            bg="#121212", fg="#c0c0c0",
-            height=20, relief=tk.FLAT,
+            root, state="disabled", font=("Courier", 8),
+            bg="#121212", fg="#c0c0c0", height=10, relief=tk.FLAT,
         )
-        self._log_widget.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 16))
+        self._log_widget.pack(fill=tk.BOTH, expand=True, padx=12, pady=(0, 12))
 
     def _attach_log_handler(self) -> None:
         handler = TextHandler(self._log_widget)
@@ -204,34 +185,29 @@ class CalibrationApp:
         self._session = CalibrationSession(
             output_dir=Path("output"),
             n_passes=n_passes,
-            on_progress=self._on_progress,
+            on_patch_progress=self._on_patch_progress,
+            on_pass_complete=self._on_pass_complete,
             on_complete=self._on_complete,
             on_error=self._on_error,
         )
 
-        # Launch the on-screen target in its own thread
         display_ready = threading.Event()
-        self._display = CalibrationDisplay(
-            on_ready=lambda: display_ready.set(),
-        )
+        self._display = CalibrationDisplay(on_ready=lambda: display_ready.set())
 
         def run_display() -> None:
-            self._session.display_update_fn = self._display.update_matrix
             self._session.display_ref = self._display
-            self._display.show()   # blocks until closed
+            self._display.show()
 
         display_thread = threading.Thread(target=run_display, daemon=True, name="DisplayThread")
         display_thread.start()
-
-        # Wait up to 3s for display to be ready
         display_ready.wait(timeout=3.0)
 
-        # Start calibration loop
         self._session.start()
 
         self._btn_start.configure(state=tk.DISABLED)
         self._btn_stop.configure(state=tk.NORMAL)
         self._progress["value"] = 0
+        self._status_var.set("Calibration starting…")
         self._de_var.set("ΔE — calibration running…")
 
     def _stop(self) -> None:
@@ -239,30 +215,27 @@ class CalibrationApp:
             self._session.stop()
         self._btn_start.configure(state=tk.NORMAL)
         self._btn_stop.configure(state=tk.DISABLED)
+        self._status_var.set("Stopped")
 
     def _toggle_preview(self) -> None:
-        """Switch the on-screen target between corrected (After) and uncorrected (Before)."""
+        """Switch the comparison grid between corrected (After) and uncorrected (Before)."""
         self._showing_corrected = not self._showing_corrected
         if self._showing_corrected:
-            # Show corrected colours
             matrix = self._session.current_matrix if self._session else None
             label = "👁  Before"
         else:
-            # Show original uncorrected colours
             matrix = None
             label = "✅  After"
         self._btn_toggle.configure(text=label)
-        if hasattr(self, "_display") and self._display is not None:
+        if self._display is not None:
             self._display.update_matrix(matrix)
 
     def _apply_profile(self) -> None:
         if self._icc_path is None or not self._icc_path.exists():
             messagebox.showerror("Error", "No ICC profile found. Run calibration first.")
             return
-
         import subprocess
         try:
-            # Try colord (modern desktop)
             result = subprocess.run(
                 ["colormgr", "import-profile", str(self._icc_path)],
                 capture_output=True, text=True,
@@ -276,36 +249,34 @@ class CalibrationApp:
                 return
         except FileNotFoundError:
             pass
-
-        # Fallback: xcalib
         try:
-            subprocess.run(
-                ["xcalib", "-d", ":0", str(self._icc_path)],
-                check=True,
-            )
-            messagebox.showinfo(
-                "Profile applied",
-                f"VCGT loaded via xcalib.\n\n{self._icc_path}\n\n"
-                "Note: xcalib only applies VCGT, not the full matrix. "
-                "For full correction, import via colord.",
-            )
+            subprocess.run(["xcalib", "-d", ":0", str(self._icc_path)], check=True)
+            messagebox.showinfo("Profile applied",
+                                f"VCGT loaded via xcalib.\n\n{self._icc_path}")
         except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-            messagebox.showerror(
-                "Could not apply profile",
-                f"Please manually load the profile:\n{self._icc_path}\n\nError: {exc}",
-            )
+            messagebox.showerror("Could not apply profile",
+                                 f"Please manually load:\n{self._icc_path}\n\nError: {exc}")
 
     # ------------------------------------------------------------------
     # Session callbacks (called from background thread)
     # ------------------------------------------------------------------
 
-    def _on_progress(self, pass_num: int, total: int, de_before: float, de_after: float) -> None:
-        pct = int(pass_num / total * 100)
+    def _on_patch_progress(
+        self, pass_num: int, patch_idx: int, n_patches: int, pct: int, name: str
+    ) -> None:
         self.root.after(0, self._progress.configure, {"value": pct})
         self.root.after(
-            0,
-            self._de_var.set,
-            f"Pass {pass_num}/{total}  —  ΔE before: {de_before:.2f}  →  after: {de_after:.2f}",
+            0, self._status_var.set,
+            f"Pass {pass_num}/{self._passes_var.get()} — "
+            f"Patch {patch_idx}/{n_patches}: {name}",
+        )
+
+    def _on_pass_complete(
+        self, pass_num: int, total: int, de_before: float, de_after: float
+    ) -> None:
+        self.root.after(
+            0, self._de_var.set,
+            f"Pass {pass_num}/{total}  ΔE {de_before:.2f} → {de_after:.2f}",
         )
 
     def _on_complete(self, icc_path: Path) -> None:
@@ -315,9 +286,9 @@ class CalibrationApp:
         self.root.after(0, self._btn_apply.configure, {"state": tk.NORMAL})
         self.root.after(0, self._btn_toggle.configure, {"state": tk.NORMAL})
         self.root.after(0, self._progress.configure, {"value": 100})
+        self.root.after(0, self._status_var.set, "Calibration complete ✓")
         self.root.after(
-            0,
-            messagebox.showinfo,
+            0, messagebox.showinfo,
             "Calibration complete",
             f"ICC profile saved:\n{icc_path}\n\nClick 'Apply Profile' to load it.",
         )
@@ -325,6 +296,7 @@ class CalibrationApp:
     def _on_error(self, exc: Exception) -> None:
         self.root.after(0, self._btn_start.configure, {"state": tk.NORMAL})
         self.root.after(0, self._btn_stop.configure, {"state": tk.DISABLED})
+        self.root.after(0, self._status_var.set, f"Error: {exc}")
         self.root.after(0, messagebox.showerror, "Calibration error", str(exc))
 
     # ------------------------------------------------------------------
@@ -340,10 +312,6 @@ class CalibrationApp:
             self._session.stop()
         self.root.destroy()
 
-
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 def main() -> None:
     app = CalibrationApp()
